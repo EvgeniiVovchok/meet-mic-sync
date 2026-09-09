@@ -23,21 +23,84 @@ internal static class Program
 internal static class Log
 {
     private static readonly object Gate = new();
-    private static readonly string Path = System.IO.Path.Combine(
+    private static readonly string Dir = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "MeetMicSync", "log.txt");
+        "MeetMicSync");
+    private static readonly string LogPath = Path.Combine(Dir, "log.txt");
+    private static readonly string SettingsPath = Path.Combine(Dir, "settings.ini");
 
-    public static string FilePath => Path;
+    private static bool _enabled;
+
+    public static string FilePath => LogPath;
+
+    public static bool Enabled
+    {
+        get { lock (Gate) return _enabled; }
+        set
+        {
+            lock (Gate)
+            {
+                if (_enabled == value)
+                    return;
+                _enabled = value;
+                SaveSettings();
+                if (_enabled)
+                {
+                    Directory.CreateDirectory(Dir);
+                    File.AppendAllText(LogPath,
+                        $"--- logging enabled {DateTime.Now:O} ---{Environment.NewLine}");
+                }
+            }
+        }
+    }
+
+    static Log()
+    {
+        _enabled = LoadEnabled();
+    }
 
     public static void Write(string message)
     {
+        if (!_enabled)
+            return;
+
         var line = $"{DateTime.Now:HH:mm:ss.fff}  {message}";
         lock (Gate)
         {
-            Directory.CreateDirectory(System.IO.Path.GetDirectoryName(Path)!);
-            File.AppendAllText(Path, line + Environment.NewLine);
+            if (!_enabled)
+                return;
+            Directory.CreateDirectory(Dir);
+            File.AppendAllText(LogPath, line + Environment.NewLine);
         }
         Debug.WriteLine(line);
+    }
+
+    private static bool LoadEnabled()
+    {
+        try
+        {
+            if (!File.Exists(SettingsPath))
+                return false;
+            foreach (var raw in File.ReadAllLines(SettingsPath))
+            {
+                var line = raw.Trim();
+                if (line.StartsWith("Logging=", StringComparison.OrdinalIgnoreCase))
+                    return line.Equals("Logging=1", StringComparison.OrdinalIgnoreCase)
+                        || line.Equals("Logging=true", StringComparison.OrdinalIgnoreCase);
+            }
+        }
+        catch { /* default off */ }
+        return false;
+    }
+
+    private static void SaveSettings()
+    {
+        try
+        {
+            Directory.CreateDirectory(Dir);
+            File.WriteAllText(SettingsPath, $"Logging={(_enabled ? "1" : "0")}{Environment.NewLine}");
+        }
+        catch { /* ignore */ }
     }
 }
 
@@ -57,14 +120,6 @@ internal sealed class SyncApplication : IDisposable
 
     public SyncApplication()
     {
-        // Fresh log each run
-        try
-        {
-            Directory.CreateDirectory(System.IO.Path.GetDirectoryName(Log.FilePath)!);
-            File.WriteAllText(Log.FilePath, $"--- MeetMicSync start {DateTime.Now:O} ---{Environment.NewLine}");
-        }
-        catch { /* ignore */ }
-
         _micWatcher = new MicMuteWatcher(OnMicMuteChanged, OnCaptureDeviceStateChanged);
         _osdWatcher = new LenovoOsdWatcher(OnLenovoOsd);
 
@@ -137,6 +192,16 @@ internal sealed class SyncApplication : IDisposable
         {
             try
             {
+                if (!File.Exists(Log.FilePath))
+                {
+                    MessageBox.Show(
+                        "No log file yet.\n\nEnable logging from the tray menu first, then reproduce the issue.",
+                        "Meet Mic Sync",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information);
+                    return;
+                }
+
                 Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{Log.FilePath}\"")
                 {
                     UseShellExecute = true
@@ -147,6 +212,26 @@ internal sealed class SyncApplication : IDisposable
                 Log.Write($"open log failed: {ex.Message}");
             }
         });
+
+        var loggingItem = new ToolStripMenuItem();
+        void RefreshLoggingItem()
+        {
+            loggingItem.Text = Log.Enabled ? "Disable logging" : "Enable logging";
+        }
+        RefreshLoggingItem();
+        loggingItem.Click += (_, _) =>
+        {
+            Log.Enabled = !Log.Enabled;
+            RefreshLoggingItem();
+            _tray.ShowBalloonTip(
+                2000,
+                "Meet Mic Sync",
+                Log.Enabled ? "Logging enabled." : "Logging disabled.",
+                ToolTipIcon.Info);
+        };
+        menu.Opening += (_, _) => RefreshLoggingItem();
+        menu.Items.Add(loggingItem);
+
         menu.Items.Add("Exit", null, (_, _) =>
         {
             _tray.Visible = false;
