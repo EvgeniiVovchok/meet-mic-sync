@@ -76,7 +76,8 @@ dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=
 | **Test Meet mute (Ctrl+D)** | Test finding Meet and toggling mute without the Lenovo key |
 | **Start with Windows…** | Copy to a user folder + add Startup shortcut (with confirmation) |
 | **Remove from Windows Startup…** | Remove the Startup shortcut (with confirmation) |
-| **Open log** | Open the log file (`%LOCALAPPDATA%\MeetMicSync\log.txt`) |
+| **Open log** | Open the log file (only useful after logging is enabled) |
+| **Enable logging** / **Disable logging** | Turn diagnostic logging on or off (off by default) |
 | **Exit** | Quit the app |
 
 ## Notes
