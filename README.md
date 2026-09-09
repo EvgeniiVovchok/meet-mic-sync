@@ -84,8 +84,4 @@ dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=
 
 - The Meet tab must be **active** in the browser window (the window title should contain `Meet`). If another tab is selected in the same window, the app may not find the call.
 - This is an unofficial utility and is not affiliated with Google or Lenovo.
-- Behavior can vary by Lenovo model. If Meet mute does not toggle, check the log from the tray menu.
-
-## License
-
-Add your chosen license here when you publish the repository (for example MIT).
+- Tested on **Lenovo ThinkBook 16p Gen 2** (machine type `20YM`). Behavior can vary by Lenovo model. If Meet mute does not toggle, check the log from the tray menu.
