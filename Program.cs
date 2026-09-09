@@ -791,17 +791,19 @@ internal sealed class MeetMuteSender
             return false;
         }
 
-        // 1) Prefer UI Automation click — works even when SendInput focus fails.
-        if (TryInvokeMuteButton(hwnd, out var via))
+        // Prefer exact self-mute control in the bottom bar. Never fuzzy-match
+        // "microphone" — that also hits per-participant mute and opens
+        // "Mute X for everyone?" dialogs.
+        if (TryInvokeSelfMuteButton(hwnd, out var via))
         {
             detail += $" [{via}]";
             Log.Write($"Meet mute via UIA: {via}");
             return true;
         }
 
-        Log.Write("UIA mute button not found — falling back to Ctrl+D");
+        Log.Write("UIA self-mute button not found — falling back to Ctrl+D");
 
-        // 2) Fallback: force foreground on UI thread, then real Ctrl+D.
+        // Fallback: force foreground on UI thread, then real Ctrl+D.
         if (!EnsureForeground(hwnd))
             Log.Write("WARNING: SetForegroundWindow did not stick — Ctrl+D may miss");
 
@@ -811,7 +813,7 @@ internal sealed class MeetMuteSender
         return true;
     }
 
-    private static bool TryInvokeMuteButton(IntPtr hwnd, out string via)
+    private static bool TryInvokeSelfMuteButton(IntPtr hwnd, out string via)
     {
         via = "";
         try
@@ -820,6 +822,7 @@ internal sealed class MeetMuteSender
             if (root is null)
                 return false;
 
+            // Exact labels used by Meet for *your* toolbar mute only.
             string[] names =
             [
                 "Turn off microphone",
@@ -830,50 +833,48 @@ internal sealed class MeetMuteSender
                 "Mikrofon einschalten"
             ];
 
+            System.Windows.Automation.AutomationElement? best = null;
+            var bestBottom = double.MinValue;
+            var bestName = "";
+
             foreach (var name in names)
             {
-                var cond = new System.Windows.Automation.PropertyCondition(
-                    System.Windows.Automation.AutomationElement.NameProperty, name);
-                var el = root.FindFirst(System.Windows.Automation.TreeScope.Descendants, cond);
-                if (el is null)
-                    continue;
+                var cond = new System.Windows.Automation.AndCondition(
+                    new System.Windows.Automation.PropertyCondition(
+                        System.Windows.Automation.AutomationElement.NameProperty, name),
+                    new System.Windows.Automation.PropertyCondition(
+                        System.Windows.Automation.AutomationElement.ControlTypeProperty,
+                        System.Windows.Automation.ControlType.Button));
 
-                if (el.TryGetCurrentPattern(System.Windows.Automation.InvokePattern.Pattern, out var pattern) &&
-                    pattern is System.Windows.Automation.InvokePattern invoke)
+                var matches = root.FindAll(System.Windows.Automation.TreeScope.Descendants, cond);
+                foreach (System.Windows.Automation.AutomationElement el in matches)
                 {
-                    invoke.Invoke();
-                    via = $"UIA:{name}";
-                    return true;
+                    System.Windows.Rect rect;
+                    try { rect = el.Current.BoundingRectangle; }
+                    catch { continue; }
+
+                    if (rect.IsEmpty || rect.Width <= 0 || rect.Height <= 0)
+                        continue;
+
+                    // Toolbar mute sits at the bottom of the window; tile controls are higher.
+                    if (rect.Bottom >= bestBottom)
+                    {
+                        bestBottom = rect.Bottom;
+                        best = el;
+                        bestName = name;
+                    }
                 }
             }
 
-            // Broader: any button whose name contains microphone / микрофон.
-            var buttons = root.FindAll(
-                System.Windows.Automation.TreeScope.Descendants,
-                new System.Windows.Automation.PropertyCondition(
-                    System.Windows.Automation.AutomationElement.ControlTypeProperty,
-                    System.Windows.Automation.ControlType.Button));
+            if (best is null)
+                return false;
 
-            foreach (System.Windows.Automation.AutomationElement el in buttons)
+            if (best.TryGetCurrentPattern(System.Windows.Automation.InvokePattern.Pattern, out var pattern) &&
+                pattern is System.Windows.Automation.InvokePattern invoke)
             {
-                string? name;
-                try { name = el.Current.Name; }
-                catch { continue; }
-                if (string.IsNullOrEmpty(name))
-                    continue;
-
-                if (!name.Contains("microphone", StringComparison.OrdinalIgnoreCase) &&
-                    !name.Contains("микрофон", StringComparison.OrdinalIgnoreCase) &&
-                    !name.Contains("Mikrofon", StringComparison.OrdinalIgnoreCase))
-                    continue;
-
-                if (el.TryGetCurrentPattern(System.Windows.Automation.InvokePattern.Pattern, out var pattern) &&
-                    pattern is System.Windows.Automation.InvokePattern invoke)
-                {
-                    invoke.Invoke();
-                    via = $"UIA-fuzzy:{name}";
-                    return true;
-                }
+                invoke.Invoke();
+                via = $"UIA-self:{bestName}";
+                return true;
             }
         }
         catch (Exception ex)
