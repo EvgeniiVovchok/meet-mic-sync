@@ -84,6 +84,15 @@ internal sealed class SyncApplication : IDisposable
         SetTray(micOk || osdOk
             ? "Meet Mic Sync — listening (mic+OSD)"
             : "Meet Mic Sync — failed to start watchers");
+
+        if (!AppInstall.StartupShortcutExists())
+        {
+            _tray.ShowBalloonTip(
+                5000,
+                "Meet Mic Sync",
+                "Tip: right-click this icon → “Start with Windows…” to run automatically at sign-in.",
+                ToolTipIcon.Info);
+        }
     }
 
     private ContextMenuStrip BuildMenu()
@@ -95,9 +104,35 @@ internal sealed class SyncApplication : IDisposable
             Log.Write($"TEST Ctrl+D ok={ok} detail={detail}");
             SetTray(ok ? $"Test OK → {detail}" : "Test FAIL — Meet window not found");
             _tray.ShowBalloonTip(2000, "Meet Mic Sync",
-                ok ? $"Sent Ctrl+D to {detail}" : "Meet window not found. Open a Meet tab.",
+                ok ? $"Muted/unmuted Meet: {detail}" : "Meet window not found. Open a Meet tab.",
                 ok ? ToolTipIcon.Info : ToolTipIcon.Warning);
         });
+
+        menu.Items.Add(new ToolStripSeparator());
+
+        var startupItem = new ToolStripMenuItem();
+        void RefreshStartupItem()
+        {
+            if (AppInstall.StartupShortcutExists())
+            {
+                startupItem.Text = "Remove from Windows Startup…";
+                startupItem.Click -= OnEnableStartupClick;
+                startupItem.Click -= OnDisableStartupClick;
+                startupItem.Click += OnDisableStartupClick;
+            }
+            else
+            {
+                startupItem.Text = "Start with Windows…";
+                startupItem.Click -= OnEnableStartupClick;
+                startupItem.Click -= OnDisableStartupClick;
+                startupItem.Click += OnEnableStartupClick;
+            }
+        }
+
+        RefreshStartupItem();
+        menu.Opening += (_, _) => RefreshStartupItem();
+        menu.Items.Add(startupItem);
+
         menu.Items.Add("Open log", null, (_, _) =>
         {
             try
@@ -118,6 +153,83 @@ internal sealed class SyncApplication : IDisposable
             Application.Exit();
         });
         return menu;
+    }
+
+    private void OnEnableStartupClick(object? sender, EventArgs e)
+    {
+        var answer = MessageBox.Show(
+            AppInstall.BuildConfirmMessage(),
+            "Start Meet Mic Sync with Windows?",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Question,
+            MessageBoxDefaultButton.Button2);
+
+        if (answer != DialogResult.Yes)
+        {
+            Log.Write("install: user cancelled Enable Startup");
+            return;
+        }
+
+        var result = AppInstall.EnableStartup();
+        if (!result.Success)
+        {
+            MessageBox.Show(result.Message, "Meet Mic Sync", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
+        }
+
+        if (result.NeedsRestart)
+        {
+            MessageBox.Show(
+                result.Message,
+                "Meet Mic Sync",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            try
+            {
+                AppInstall.RestartFromInstalledCopy();
+            }
+            catch (Exception ex)
+            {
+                Log.Write($"restart from install dir failed: {ex.Message}");
+                MessageBox.Show(
+                    "The Startup shortcut was created, but the app could not restart from the new folder automatically.\n\n" +
+                    $"Please run:\n{AppInstall.InstalledExePath}",
+                    "Meet Mic Sync",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return;
+            }
+
+            _tray.Visible = false;
+            Application.Exit();
+            return;
+        }
+
+        MessageBox.Show(result.Message, "Meet Mic Sync", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        _tray.ShowBalloonTip(2500, "Meet Mic Sync", "Will start automatically when you sign in.", ToolTipIcon.Info);
+    }
+
+    private void OnDisableStartupClick(object? sender, EventArgs e)
+    {
+        var answer = MessageBox.Show(
+            AppInstall.BuildRemoveConfirmMessage(),
+            "Remove from Windows Startup?",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Question,
+            MessageBoxDefaultButton.Button2);
+
+        if (answer != DialogResult.Yes)
+        {
+            Log.Write("install: user cancelled Remove Startup");
+            return;
+        }
+
+        var result = AppInstall.DisableStartup();
+        MessageBox.Show(
+            result.Message,
+            "Meet Mic Sync",
+            MessageBoxButtons.OK,
+            result.Success ? MessageBoxIcon.Information : MessageBoxIcon.Error);
     }
 
     private void OnMicMuteChanged(bool muted)
