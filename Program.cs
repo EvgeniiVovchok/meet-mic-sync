@@ -155,11 +155,11 @@ internal sealed class SyncApplication : IDisposable
         var menu = new ContextMenuStrip();
         menu.Items.Add("Test Meet mute (Ctrl+D)", null, (_, _) =>
         {
-            var ok = _sender.TryToggleMeetMute(out var detail);
-            Log.Write($"TEST Ctrl+D ok={ok} detail={detail}");
+            var ok = _sender.TrySyncMeetMute(wantMuted: null, out var detail);
+            Log.Write($"TEST toggle ok={ok} detail={detail}");
             SetTray(ok ? $"Test OK → {detail}" : "Test FAIL — Meet window not found");
             _tray.ShowBalloonTip(2000, "Meet Mic Sync",
-                ok ? $"Muted/unmuted Meet: {detail}" : "Meet window not found. Open a Meet tab.",
+                ok ? $"Toggled Meet: {detail}" : "Meet window not found. Open a Meet tab.",
                 ok ? ToolTipIcon.Info : ToolTipIcon.Warning);
         });
 
@@ -335,13 +335,16 @@ internal sealed class SyncApplication : IDisposable
             Log.Write($"mic mute changed → muted={muted}");
         }
 
-        TriggerFrom("mic-mute", muted ? "muted" : "unmuted");
+        TriggerFrom("mic-mute", muted ? "muted" : "unmuted", wantMuted: muted);
     }
 
     private void OnLenovoOsd(string info)
     {
         Log.Write($"lenovo OSD/event: {info}");
-        TriggerFrom("lenovo-osd", info);
+        // OSD often arrives after mic-mute (debounced). If it arrives alone, use last known mic state.
+        bool? want = null;
+        lock (_gate) { want = _lastMuted; }
+        TriggerFrom("lenovo-osd", info, wantMuted: want);
     }
 
     private void OnCaptureDeviceStateChanged(string deviceId, int newState)
@@ -350,10 +353,14 @@ internal sealed class SyncApplication : IDisposable
         Log.Write($"capture device state id={deviceId} state={newState}");
         // Lenovo hardware mute often disables the endpoint instead of soft-mute.
         if (newState is 1 or 2 or 8)
-            TriggerFrom("device-state", $"state={newState}");
+        {
+            // ACTIVE → want unmuted; DISABLED/UNPLUGGED → want muted
+            bool wantMuted = newState != 1;
+            TriggerFrom("device-state", $"state={newState}", wantMuted: wantMuted);
+        }
     }
 
-    private void TriggerFrom(string source, string info)
+    private void TriggerFrom(string source, string info, bool? wantMuted)
     {
         lock (_gate)
         {
@@ -370,11 +377,11 @@ internal sealed class SyncApplication : IDisposable
         // background thread is ignored by Chrome — always marshal first.
         void Run()
         {
-            var ok = _sender.TryToggleMeetMute(out var detail);
-            Log.Write($"toggle after {source} ({info}): ok={ok} detail={detail}");
+            var ok = _sender.TrySyncMeetMute(wantMuted, out var detail);
+            Log.Write($"sync after {source} ({info}) wantMuted={wantMuted}: ok={ok} detail={detail}");
             SetTray(ok
                 ? $"Synced via {source} → {detail}"
-                : $"Saw {source}, but Meet toggle failed");
+                : $"Saw {source}, but Meet sync failed");
         }
 
         var menu = _tray.ContextMenuStrip;
@@ -781,7 +788,10 @@ internal sealed class DeviceNotificationClient : IMMNotificationClient
 
 internal sealed class MeetMuteSender
 {
-    public bool TryToggleMeetMute(out string detail)
+    /// <param name="wantMuted">
+    /// true = make sure Meet is muted; false = unmuted; null = toggle (test menu).
+    /// </param>
+    public bool TrySyncMeetMute(bool? wantMuted, out string detail)
     {
         detail = "";
         if (!TryFindMeetWindow(out var hwnd, out detail))
@@ -791,47 +801,146 @@ internal sealed class MeetMuteSender
             return false;
         }
 
-        // Prefer exact self-mute control in the bottom bar. Never fuzzy-match
-        // "microphone" — that also hits per-participant mute and opens
-        // "Mute X for everyone?" dialogs.
-        if (TryInvokeSelfMuteButton(hwnd, out var via))
+        // State-based UIA: click only the toolbar button that achieves the desired state.
+        // Blind toggle caused "unmute works, mute doesn't" when Meet/Windows drifted apart.
+        if (wantMuted is bool desired)
         {
+            var action = TryApplyMeetMuteState(hwnd, desired, out var via);
             detail += $" [{via}]";
-            Log.Write($"Meet mute via UIA: {via}");
+            Log.Write($"Meet sync wantMuted={desired}: {via}");
+            return action;
+        }
+
+        // Explicit toggle (tray test): Ctrl+D first, then UIA flip of whichever self-button is shown.
+        if (EnsureForeground(hwnd))
+        {
+            Thread.Sleep(40);
+            SendCtrlD();
+            detail += " [Ctrl+D]";
+            Log.Write("Meet toggle via Ctrl+D");
             return true;
         }
 
-        Log.Write("UIA self-mute button not found — falling back to Ctrl+D");
+        if (TryClickEitherSelfMute(hwnd, out var toggleVia))
+        {
+            detail += $" [{toggleVia}]";
+            return true;
+        }
 
-        // Fallback: force foreground on UI thread, then real Ctrl+D.
-        if (!EnsureForeground(hwnd))
-            Log.Write("WARNING: SetForegroundWindow did not stick — Ctrl+D may miss");
-
-        Thread.Sleep(40);
         SendCtrlD();
-        detail += " [Ctrl+D]";
+        detail += " [Ctrl+D-nofocus]";
         return true;
     }
 
-    private static bool TryInvokeSelfMuteButton(IntPtr hwnd, out string via)
+    private static bool TryApplyMeetMuteState(IntPtr hwnd, bool wantMuted, out string via)
     {
+        // Labels that appear when Meet is currently UNMUTED (click → mute).
+        string[] muteLabels =
+        [
+            "Turn off microphone",
+            "Выключить микрофон",
+            "Mikrofon ausschalten"
+        ];
+        // Labels that appear when Meet is currently MUTED (click → unmute).
+        string[] unmuteLabels =
+        [
+            "Turn on microphone",
+            "Включить микрофон",
+            "Mikrofon einschalten"
+        ];
+
+        var needClick = wantMuted ? muteLabels : unmuteLabels;
+        var alreadyOk = wantMuted ? unmuteLabels : muteLabels;
+
+        if (TryClickToolbarButton(hwnd, needClick, out var clicked))
+        {
+            via = wantMuted ? $"mute:{clicked}" : $"unmute:{clicked}";
+            return true;
+        }
+
+        if (FindToolbarButton(hwnd, alreadyOk, out var present))
+        {
+            // Desired state already reflected in Meet UI — do not toggle.
+            via = $"already-{(wantMuted ? "muted" : "unmuted")}:{present}";
+            return true;
+        }
+
+        // Unknown UI — fall back to Ctrl+D (may desync if Meet state unknown).
+        Log.Write("UIA did not see expected self-mute labels — Ctrl+D fallback");
+        if (!EnsureForeground(hwnd))
+            Log.Write("WARNING: SetForegroundWindow did not stick — Ctrl+D may miss");
+        Thread.Sleep(40);
+        SendCtrlD();
+        via = "Ctrl+D-fallback";
+        return true;
+    }
+
+    private static bool TryClickEitherSelfMute(IntPtr hwnd, out string via)
+    {
+        string[] all =
+        [
+            "Turn off microphone", "Turn on microphone",
+            "Выключить микрофон", "Включить микрофон",
+            "Mikrofon ausschalten", "Mikrofon einschalten"
+        ];
+        if (TryClickToolbarButton(hwnd, all, out var name))
+        {
+            via = $"UIA-toggle:{name}";
+            return true;
+        }
         via = "";
+        return false;
+    }
+
+    private static bool TryClickToolbarButton(IntPtr hwnd, string[] names, out string clickedName)
+    {
+        clickedName = "";
+        if (!FindToolbarButton(hwnd, names, out var el, out clickedName) || el is null)
+            return false;
+
+        try
+        {
+            if (el.TryGetCurrentPattern(System.Windows.Automation.InvokePattern.Pattern, out var pattern) &&
+                pattern is System.Windows.Automation.InvokePattern invoke)
+            {
+                invoke.Invoke();
+                return true;
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Write($"UIA invoke error: {ex.Message}");
+        }
+
+        return false;
+    }
+
+    private static bool FindToolbarButton(IntPtr hwnd, string[] names, out string foundName)
+        => FindToolbarButton(hwnd, names, out _, out foundName);
+
+    private static bool FindToolbarButton(
+        IntPtr hwnd,
+        string[] names,
+        out System.Windows.Automation.AutomationElement? element,
+        out string foundName)
+    {
+        element = null;
+        foundName = "";
         try
         {
             var root = System.Windows.Automation.AutomationElement.FromHandle(hwnd);
             if (root is null)
                 return false;
 
-            // Exact labels used by Meet for *your* toolbar mute only.
-            string[] names =
-            [
-                "Turn off microphone",
-                "Turn on microphone",
-                "Выключить микрофон",
-                "Включить микрофон",
-                "Mikrofon ausschalten",
-                "Mikrofon einschalten"
-            ];
+            System.Windows.Rect windowRect;
+            try { windowRect = root.Current.BoundingRectangle; }
+            catch { return false; }
+
+            if (windowRect.IsEmpty || windowRect.Height <= 0)
+                return false;
+
+            // Only consider controls in the bottom toolbar band.
+            var toolbarTop = windowRect.Top + windowRect.Height * 0.72;
 
             System.Windows.Automation.AutomationElement? best = null;
             var bestBottom = double.MinValue;
@@ -849,40 +958,42 @@ internal sealed class MeetMuteSender
                 var matches = root.FindAll(System.Windows.Automation.TreeScope.Descendants, cond);
                 foreach (System.Windows.Automation.AutomationElement el in matches)
                 {
-                    System.Windows.Rect rect;
-                    try { rect = el.Current.BoundingRectangle; }
-                    catch { continue; }
-
-                    if (rect.IsEmpty || rect.Width <= 0 || rect.Height <= 0)
-                        continue;
-
-                    // Toolbar mute sits at the bottom of the window; tile controls are higher.
-                    if (rect.Bottom >= bestBottom)
+                    try
                     {
-                        bestBottom = rect.Bottom;
-                        best = el;
-                        bestName = name;
+                        if (el.Current.IsOffscreen)
+                            continue;
+                        if (!el.Current.IsEnabled)
+                            continue;
+
+                        var rect = el.Current.BoundingRectangle;
+                        if (rect.IsEmpty || rect.Width <= 0 || rect.Height <= 0)
+                            continue;
+                        if (rect.Top < toolbarTop)
+                            continue;
+
+                        if (rect.Bottom >= bestBottom)
+                        {
+                            bestBottom = rect.Bottom;
+                            best = el;
+                            bestName = name;
+                        }
                     }
+                    catch { /* stale UIA node */ }
                 }
             }
 
             if (best is null)
                 return false;
 
-            if (best.TryGetCurrentPattern(System.Windows.Automation.InvokePattern.Pattern, out var pattern) &&
-                pattern is System.Windows.Automation.InvokePattern invoke)
-            {
-                invoke.Invoke();
-                via = $"UIA-self:{bestName}";
-                return true;
-            }
+            element = best;
+            foundName = bestName;
+            return true;
         }
         catch (Exception ex)
         {
-            Log.Write($"UIA error: {ex.GetType().Name}: {ex.Message}");
+            Log.Write($"UIA find error: {ex.GetType().Name}: {ex.Message}");
+            return false;
         }
-
-        return false;
     }
 
     private static void LogBrowserTitles()
