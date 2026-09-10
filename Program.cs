@@ -341,10 +341,36 @@ internal sealed class SyncApplication : IDisposable
     private void OnLenovoOsd(string info)
     {
         Log.Write($"lenovo OSD/event: {info}");
-        // OSD often arrives after mic-mute (debounced). If it arrives alone, use last known mic state.
-        bool? want = null;
-        lock (_gate) { want = _lastMuted; }
-        TriggerFrom("lenovo-osd", info, wantMuted: want);
+
+        // Lenovo often shows OSD without a Core Audio mute callback (especially across
+        // meetings). Using stale _lastMuted made us sync the wrong direction (e.g. always
+        // unmute). Decide after a short settle: if Windows mute actually flipped → state
+        // sync; otherwise treat the key as a Meet toggle.
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            Thread.Sleep(70);
+            var live = _micWatcher.TryReadMuted();
+            bool? want;
+
+            lock (_gate)
+            {
+                if (live is bool now && _lastMuted is bool prev && now != prev)
+                {
+                    Log.Write($"osd: Windows mute {prev} → {now} (state sync)");
+                    _lastMuted = now;
+                    want = now;
+                }
+                else
+                {
+                    if (live is bool now2)
+                        _lastMuted = now2;
+                    Log.Write($"osd: Windows mute unchanged (live={live}) — toggle Meet");
+                    want = null; // toggle
+                }
+            }
+
+            TriggerFrom("lenovo-osd", info, wantMuted: want);
+        });
     }
 
     private void OnCaptureDeviceStateChanged(string deviceId, int newState)
@@ -461,6 +487,69 @@ internal sealed class MicMuteWatcher : IDisposable
         {
             Log.Write($"mic Start exception: {ex}");
             return false;
+        }
+    }
+
+    /// <summary>Best-effort current mute of default capture (communications, then console).</summary>
+    public bool? TryReadMuted()
+    {
+        try
+        {
+            if (_enumerator is null)
+                return null;
+
+            if (TryGetMute(_enumerator, ERole.eCommunications, out var muted) ||
+                TryGetMute(_enumerator, ERole.eConsole, out muted))
+                return muted;
+
+            // Fall back to any subscribed endpoint.
+            foreach (var s in _subscriptions.ToArray())
+            {
+                try
+                {
+                    s.Volume.GetMute(out var m);
+                    return m != 0;
+                }
+                catch { /* ignore */ }
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Write($"TryReadMuted failed: {ex.Message}");
+        }
+
+        return null;
+    }
+
+    private static bool TryGetMute(IMMDeviceEnumerator enumerator, ERole role, out bool muted)
+    {
+        muted = false;
+        var hr = enumerator.GetDefaultAudioEndpoint(EDataFlow.eCapture, role, out var device);
+        if (hr != 0 || device is null)
+            return false;
+
+        try
+        {
+            var iid = typeof(IAudioEndpointVolume).GUID;
+            var actHr = device.Activate(ref iid, ClsCtx.ALL, IntPtr.Zero, out var obj);
+            if (actHr != 0 || obj is null)
+                return false;
+
+            var volume = (IAudioEndpointVolume)obj;
+            try
+            {
+                volume.GetMute(out var m);
+                muted = m != 0;
+                return true;
+            }
+            finally
+            {
+                Marshal.ReleaseComObject(volume);
+            }
+        }
+        finally
+        {
+            Marshal.ReleaseComObject(device);
         }
     }
 
@@ -811,19 +900,21 @@ internal sealed class MeetMuteSender
             return action;
         }
 
-        // Explicit toggle (tray test): Ctrl+D first, then UIA flip of whichever self-button is shown.
+        // Explicit toggle (tray test / Lenovo OSD without mute-flag change):
+        // click whichever self-mute toolbar button is visible, else Ctrl+D.
+        if (TryClickEitherSelfMute(hwnd, out var toggleVia))
+        {
+            detail += $" [{toggleVia}]";
+            Log.Write($"Meet toggle via UIA: {toggleVia}");
+            return true;
+        }
+
         if (EnsureForeground(hwnd))
         {
             Thread.Sleep(40);
             SendCtrlD();
             detail += " [Ctrl+D]";
             Log.Write("Meet toggle via Ctrl+D");
-            return true;
-        }
-
-        if (TryClickEitherSelfMute(hwnd, out var toggleVia))
-        {
-            detail += $" [{toggleVia}]";
             return true;
         }
 
@@ -852,20 +943,64 @@ internal sealed class MeetMuteSender
         var needClick = wantMuted ? muteLabels : unmuteLabels;
         var alreadyOk = wantMuted ? unmuteLabels : muteLabels;
 
-        if (TryClickToolbarButton(hwnd, needClick, out var clicked))
-        {
-            via = wantMuted ? $"mute:{clicked}" : $"unmute:{clicked}";
-            return true;
-        }
-
         if (FindToolbarButton(hwnd, alreadyOk, out var present))
         {
-            // Desired state already reflected in Meet UI — do not toggle.
             via = $"already-{(wantMuted ? "muted" : "unmuted")}:{present}";
             return true;
         }
 
-        // Unknown UI — fall back to Ctrl+D (may desync if Meet state unknown).
+        if (FindToolbarButton(hwnd, needClick, out var el, out var label) && el is not null)
+        {
+            // Chrome often ignores UIA Invoke; physical click on the toolbar button is reliable.
+            EnsureForeground(hwnd);
+            Thread.Sleep(30);
+            var clicked = ClickElementCenter(el);
+            Log.Write($"toolbar click '{label}' via={(clicked ? "mouse" : "none")}");
+
+            if (WaitForToolbarButton(hwnd, alreadyOk, timeoutMs: 350, out _))
+            {
+                via = $"{(wantMuted ? "mute" : "unmute")}:{label}+mouse";
+                return true;
+            }
+
+            // Invoke as second try
+            try
+            {
+                if (el.TryGetCurrentPattern(System.Windows.Automation.InvokePattern.Pattern, out var pattern) &&
+                    pattern is System.Windows.Automation.InvokePattern invoke)
+                {
+                    invoke.Invoke();
+                    if (WaitForToolbarButton(hwnd, alreadyOk, timeoutMs: 350, out _))
+                    {
+                        via = $"{(wantMuted ? "mute" : "unmute")}:{label}+invoke";
+                        return true;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Write($"UIA invoke error: {ex.Message}");
+            }
+
+            // Last resort: Ctrl+D only while Meet still shows the pre-click label.
+            if (FindToolbarButton(hwnd, needClick, out _))
+            {
+                Log.Write("UIA click did not flip Meet UI — Ctrl+D");
+                EnsureForeground(hwnd);
+                Thread.Sleep(40);
+                SendCtrlD();
+                if (WaitForToolbarButton(hwnd, alreadyOk, timeoutMs: 400, out _))
+                {
+                    via = $"{(wantMuted ? "mute" : "unmute")}:Ctrl+D-after-uia";
+                    return true;
+                }
+
+                via = $"FAILED-want-{(wantMuted ? "muted" : "unmuted")}-still-showing:{label}";
+                return false;
+            }
+        }
+
+        // No matching labels at all — Ctrl+D toggle as best effort.
         Log.Write("UIA did not see expected self-mute labels — Ctrl+D fallback");
         if (!EnsureForeground(hwnd))
             Log.Write("WARNING: SetForegroundWindow did not stick — Ctrl+D may miss");
@@ -883,36 +1018,126 @@ internal sealed class MeetMuteSender
             "Выключить микрофон", "Включить микрофон",
             "Mikrofon ausschalten", "Mikrofon einschalten"
         ];
-        if (TryClickToolbarButton(hwnd, all, out var name))
+        if (!FindToolbarButton(hwnd, all, out var el, out var name) || el is null)
         {
-            via = $"UIA-toggle:{name}";
-            return true;
+            via = "";
+            return false;
         }
-        via = "";
+
+        EnsureForeground(hwnd);
+        Thread.Sleep(30);
+        if (!ClickElementCenter(el))
+        {
+            try
+            {
+                if (el.TryGetCurrentPattern(System.Windows.Automation.InvokePattern.Pattern, out var pattern) &&
+                    pattern is System.Windows.Automation.InvokePattern invoke)
+                    invoke.Invoke();
+                else
+                {
+                    via = "";
+                    return false;
+                }
+            }
+            catch
+            {
+                via = "";
+                return false;
+            }
+        }
+
+        via = $"UIA-toggle:{name}";
+        return true;
+    }
+
+    private static bool WaitForToolbarButton(IntPtr hwnd, string[] names, int timeoutMs, out string foundName)
+    {
+        foundName = "";
+        var deadline = Environment.TickCount64 + timeoutMs;
+        while (Environment.TickCount64 <= deadline)
+        {
+            if (FindToolbarButton(hwnd, names, out foundName))
+                return true;
+            Thread.Sleep(40);
+        }
         return false;
     }
 
-    private static bool TryClickToolbarButton(IntPtr hwnd, string[] names, out string clickedName)
+    private static bool ClickElementCenter(System.Windows.Automation.AutomationElement el)
     {
-        clickedName = "";
-        if (!FindToolbarButton(hwnd, names, out var el, out clickedName) || el is null)
-            return false;
-
         try
         {
-            if (el.TryGetCurrentPattern(System.Windows.Automation.InvokePattern.Pattern, out var pattern) &&
-                pattern is System.Windows.Automation.InvokePattern invoke)
+            var rect = el.Current.BoundingRectangle;
+            if (rect.IsEmpty || rect.Width < 4 || rect.Height < 4)
+                return false;
+
+            var x = (int)Math.Round(rect.Left + rect.Width / 2);
+            var y = (int)Math.Round(rect.Top + rect.Height / 2);
+
+            GetCursorPos(out var prev);
+            // Absolute coords for SendInput: 0..65535 mapped to virtual screen.
+            var vx = GetSystemMetrics(76); // SM_XVIRTUALSCREEN
+            var vy = GetSystemMetrics(77); // SM_YVIRTUALSCREEN
+            var vw = GetSystemMetrics(78); // SM_CXVIRTUALSCREEN
+            var vh = GetSystemMetrics(79); // SM_CYVIRTUALSCREEN
+            if (vw <= 0 || vh <= 0)
+                return false;
+
+            var absX = (int)Math.Round((x - vx) * 65535.0 / Math.Max(vw - 1, 1));
+            var absY = (int)Math.Round((y - vy) * 65535.0 / Math.Max(vh - 1, 1));
+
+            var move = new INPUT
             {
-                invoke.Invoke();
-                return true;
-            }
+                type = InputType.INPUT_MOUSE,
+                U = new InputUnion
+                {
+                    mi = new MOUSEINPUT
+                    {
+                        dx = absX,
+                        dy = absY,
+                        dwFlags = MouseEventF.MOVE | MouseEventF.ABSOLUTE | MouseEventF.VIRTUALDESK
+                    }
+                }
+            };
+            var down = new INPUT
+            {
+                type = InputType.INPUT_MOUSE,
+                U = new InputUnion { mi = new MOUSEINPUT { dwFlags = MouseEventF.LEFTDOWN } }
+            };
+            var up = new INPUT
+            {
+                type = InputType.INPUT_MOUSE,
+                U = new InputUnion { mi = new MOUSEINPUT { dwFlags = MouseEventF.LEFTUP } }
+            };
+
+            var inputs = new[] { move, down, up };
+            var sent = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<INPUT>());
+
+            // Restore cursor
+            var prevAbsX = (int)Math.Round((prev.X - vx) * 65535.0 / Math.Max(vw - 1, 1));
+            var prevAbsY = (int)Math.Round((prev.Y - vy) * 65535.0 / Math.Max(vh - 1, 1));
+            var restore = new INPUT
+            {
+                type = InputType.INPUT_MOUSE,
+                U = new InputUnion
+                {
+                    mi = new MOUSEINPUT
+                    {
+                        dx = prevAbsX,
+                        dy = prevAbsY,
+                        dwFlags = MouseEventF.MOVE | MouseEventF.ABSOLUTE | MouseEventF.VIRTUALDESK
+                    }
+                }
+            };
+            _ = SendInput(1, [restore], Marshal.SizeOf<INPUT>());
+
+            return sent == inputs.Length;
         }
         catch (Exception ex)
         {
-            Log.Write($"UIA invoke error: {ex.Message}");
+            Log.Write($"ClickElementCenter error: {ex.Message}");
+            return false;
         }
-
-        return false;
     }
 
     private static bool FindToolbarButton(IntPtr hwnd, string[] names, out string foundName)
@@ -1195,6 +1420,12 @@ internal sealed class MeetMuteSender
 
     [DllImport("user32.dll")]
     private static extern uint MapVirtualKey(uint uCode, uint uMapType);
+
+    [DllImport("user32.dll")]
+    private static extern bool GetCursorPos(out POINT lpPoint);
+
+    [DllImport("user32.dll")]
+    private static extern int GetSystemMetrics(int nIndex);
 }
 
 #region Core Audio + Win32 interop
@@ -1304,12 +1535,34 @@ internal interface IAudioEndpointVolumeCallback
     [PreserveSig] int OnNotify(IntPtr pNotify);
 }
 
-internal enum InputType : uint { INPUT_KEYBOARD = 1 }
-internal enum VirtualKey : ushort { VK_CONTROL = 0x11, VK_D = 0x44 }
-[Flags] internal enum KeyEventF : uint
+internal enum InputType : uint
+{
+    INPUT_MOUSE = 0,
+    INPUT_KEYBOARD = 1
+}
+
+[Flags]
+internal enum KeyEventF : uint
 {
     KEYEVENTF_KEYUP = 0x0002,
     KEYEVENTF_SCANCODE = 0x0008
+}
+
+[Flags]
+internal enum MouseEventF : uint
+{
+    MOVE = 0x0001,
+    LEFTDOWN = 0x0002,
+    LEFTUP = 0x0004,
+    ABSOLUTE = 0x8000,
+    VIRTUALDESK = 0x4000
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct POINT
+{
+    public int X;
+    public int Y;
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -1322,7 +1575,19 @@ internal struct INPUT
 [StructLayout(LayoutKind.Explicit)]
 internal struct InputUnion
 {
+    [FieldOffset(0)] public MOUSEINPUT mi;
     [FieldOffset(0)] public KEYBDINPUT ki;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct MOUSEINPUT
+{
+    public int dx;
+    public int dy;
+    public uint mouseData;
+    public MouseEventF dwFlags;
+    public uint time;
+    public IntPtr dwExtraInfo;
 }
 
 [StructLayout(LayoutKind.Sequential)]
