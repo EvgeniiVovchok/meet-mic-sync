@@ -120,7 +120,7 @@ internal sealed class SyncApplication : IDisposable
 
     public SyncApplication()
     {
-        _micWatcher = new MicMuteWatcher(OnMicMuteChanged, OnCaptureDeviceStateChanged);
+        _micWatcher = new MicMuteWatcher(OnMicMuteChanged, OnCaptureDeviceStateChanged, OnMicReseed);
         _osdWatcher = new LenovoOsdWatcher(OnLenovoOsd);
 
         _tray = new NotifyIcon
@@ -317,6 +317,13 @@ internal sealed class SyncApplication : IDisposable
             result.Success ? MessageBoxIcon.Information : MessageBoxIcon.Error);
     }
 
+    private void OnMicReseed(bool muted)
+    {
+        lock (_gate)
+            _lastMuted = muted;
+        Log.Write($"mic reseed muted={muted}");
+    }
+
     private void OnMicMuteChanged(bool muted)
     {
         lock (_gate)
@@ -340,55 +347,18 @@ internal sealed class SyncApplication : IDisposable
 
     private void OnLenovoOsd(string info)
     {
-        Log.Write($"lenovo OSD/event: {info}");
-
-        // Act immediately. Waiting for Windows mute let hardware mute break Meet's
-        // toolbar first — then "Turn off microphone" disappears and mute fails.
-        // Infer direction from a quick live read when it already flipped; otherwise
-        // do a Meet toolbar toggle (never the old "unchanged → toggle" after delay).
-        ThreadPool.QueueUserWorkItem(_ =>
-        {
-            var live = _micWatcher.TryReadMuted();
-            bool? want;
-
-            lock (_gate)
-            {
-                if (live is bool now && _lastMuted is bool prev && now != prev)
-                {
-                    Log.Write($"osd: Windows mute {prev} → {now} (state sync, immediate)");
-                    _lastMuted = now;
-                    want = now;
-                }
-                else
-                {
-                    // Mute flag not updated yet (or Lenovo soft-mute didn't fire).
-                    // Toggle Meet via visible self-mute button / Ctrl+D.
-                    Log.Write($"osd: live={live} last={_lastMuted} — immediate Meet toggle");
-                    want = null;
-                }
-            }
-
-            TriggerFrom("lenovo-osd", info, wantMuted: want);
-
-            // Refresh cached Windows mute after Lenovo finishes applying it.
-            Thread.Sleep(150);
-            var settled = _micWatcher.TryReadMuted();
-            if (settled is bool s)
-            {
-                lock (_gate) { _lastMuted = s; }
-                Log.Write($"osd: settled Windows mute={s}");
-            }
-        });
+        // CapsLock, NumLock and Vantage raise the same FnHotkey window as mic mute.
+        // Those keys do not change the capture mute flag, so they are not a trigger.
+        Log.Write($"lenovo OSD ignored: {info}");
     }
 
     private void OnCaptureDeviceStateChanged(string deviceId, int newState)
     {
-        // 1=ACTIVE 2=DISABLED 4=NOTPRESENT 8=UNPLUGGED
+        // 1=ACTIVE 2=DISABLED. UNPLUGGED is a device going away, not the mute key.
         Log.Write($"capture device state id={deviceId} state={newState}");
-        // Lenovo hardware mute often disables the endpoint instead of soft-mute.
-        if (newState is 1 or 2 or 8)
+        // Lenovo hardware mute often disables the default capture endpoint.
+        if (newState is 1 or 2)
         {
-            // ACTIVE → want unmuted; DISABLED/UNPLUGGED → want muted
             bool wantMuted = newState != 1;
             TriggerFrom("device-state", $"state={newState}", wantMuted: wantMuted);
         }
@@ -458,11 +428,15 @@ internal sealed class MicMuteWatcher : IDisposable
 {
     private readonly Action<bool> _onMuteChanged;
     private readonly Action<string, int> _onDeviceStateChanged;
+    private readonly Action<bool> _onReseed;
     private readonly List<EndpointSubscription> _subscriptions = new();
     private readonly DeviceNotificationClient _deviceClient;
+    private readonly object _subscribeGate = new();
 
     private IMMDeviceEnumerator? _enumerator;
+    private string? _targetId;
     private bool _seeded;
+    private int _resubscribeQueued;
 
     private sealed class EndpointSubscription
     {
@@ -472,10 +446,11 @@ internal sealed class MicMuteWatcher : IDisposable
         public required VolumeCallback Callback;
     }
 
-    public MicMuteWatcher(Action<bool> onMuteChanged, Action<string, int> onDeviceStateChanged)
+    public MicMuteWatcher(Action<bool> onMuteChanged, Action<string, int> onDeviceStateChanged, Action<bool> onReseed)
     {
         _onMuteChanged = onMuteChanged;
         _onDeviceStateChanged = onDeviceStateChanged;
+        _onReseed = onReseed;
         _deviceClient = new DeviceNotificationClient(
             OnDefaultDeviceChanged,
             OnAnyDeviceStateChanged);
@@ -487,7 +462,7 @@ internal sealed class MicMuteWatcher : IDisposable
         {
             _enumerator = (IMMDeviceEnumerator)new MMDeviceEnumeratorComObject();
             _enumerator.RegisterEndpointNotificationCallback(_deviceClient);
-            var n = AttachAllCaptureEndpoints();
+            var n = SubscribeToDefault();
             Log.Write($"mic: subscribed endpoints={n}");
             return n > 0;
         }
@@ -563,16 +538,10 @@ internal sealed class MicMuteWatcher : IDisposable
 
     private void OnDefaultDeviceChanged()
     {
-        Log.Write("mic: default capture device changed — resubscribing");
-        try
-        {
-            DetachAll();
-            AttachAllCaptureEndpoints();
-        }
-        catch (Exception ex)
-        {
-            Log.Write($"mic reattach failed: {ex.Message}");
-        }
+        // Notification callbacks must not call the enumerator; that deadlocks
+        // and stops mute events after a headset connects.
+        Log.Write("mic: default capture device changed — queued resubscribe");
+        QueueResubscribe();
     }
 
     private void OnAnyDeviceStateChanged(string deviceId, int newState)
@@ -581,17 +550,88 @@ internal sealed class MicMuteWatcher : IDisposable
         if (deviceId.IndexOf("{0.0.1.", StringComparison.OrdinalIgnoreCase) < 0)
             return;
 
-        Log.Write($"mic: OnDeviceStateChanged id={deviceId} state={newState}");
-        _onDeviceStateChanged(deviceId, newState);
-        try
+        var watched = string.Equals(deviceId, _targetId, StringComparison.OrdinalIgnoreCase);
+        Log.Write($"mic: OnDeviceStateChanged id={deviceId} state={newState} watched={watched}");
+
+        // A headset appearing is not a mute press. Only the device we follow
+        // can disable/enable the endpoint Lenovo uses for hardware mute.
+        if (watched && newState is 1 or 2)
+            _onDeviceStateChanged(deviceId, newState);
+
+        QueueResubscribe();
+    }
+
+    private void QueueResubscribe()
+    {
+        if (Interlocked.Exchange(ref _resubscribeQueued, 1) == 1)
+            return;
+
+        ThreadPool.QueueUserWorkItem(_ =>
         {
+            try
+            {
+                SubscribeToDefault();
+            }
+            catch (Exception ex)
+            {
+                Log.Write($"mic resubscribe failed: {ex.Message}");
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _resubscribeQueued, 0);
+            }
+        });
+    }
+
+    /// <summary>Follow the default communications mic (headset when one is connected).</summary>
+    private int SubscribeToDefault()
+    {
+        lock (_subscribeGate)
+        {
+            if (_enumerator is null)
+                return 0;
+
+            if (!TryOpenDefault(out var device, out var id) || device is null)
+            {
+                Log.Write("mic: no default capture endpoint");
+                return _subscriptions.Count;
+            }
+
+            if (_subscriptions.Count == 1 &&
+                string.Equals(_subscriptions[0].Id, id, StringComparison.OrdinalIgnoreCase))
+            {
+                Marshal.ReleaseComObject(device);
+                return 1;
+            }
+
+            Log.Write($"mic: switching to {id}");
             DetachAll();
-            AttachAllCaptureEndpoints();
+            _targetId = id;
+            if (!TrySubscribe(device))
+            {
+                Marshal.ReleaseComObject(device);
+                return 0;
+            }
+
+            return 1;
         }
-        catch (Exception ex)
-        {
-            Log.Write($"mic state-change reattach failed: {ex.Message}");
-        }
+    }
+
+    private bool TryOpenDefault(out IMMDevice? device, out string id)
+    {
+        device = null;
+        id = "";
+        if (_enumerator is null)
+            return false;
+
+        var hr = _enumerator.GetDefaultAudioEndpoint(EDataFlow.eCapture, ERole.eCommunications, out device);
+        if (hr != 0 || device is null)
+            hr = _enumerator.GetDefaultAudioEndpoint(EDataFlow.eCapture, ERole.eConsole, out device);
+        if (hr != 0 || device is null)
+            return false;
+
+        device.GetId(out id);
+        return true;
     }
 
     private int AttachAllCaptureEndpoints()
@@ -652,6 +692,12 @@ internal sealed class MicMuteWatcher : IDisposable
         var volume = (IAudioEndpointVolume)obj;
         var callback = new VolumeCallback(muted =>
         {
+            if (!string.Equals(id, _targetId, StringComparison.OrdinalIgnoreCase))
+            {
+                Log.Write($"mic notify ignored stale id={id} muted={muted}");
+                return;
+            }
+
             Log.Write($"mic notify id={id} muted={muted}");
             _onMuteChanged(muted);
         });
@@ -677,6 +723,10 @@ internal sealed class MicMuteWatcher : IDisposable
         {
             _seeded = true;
             _onMuteChanged(muted != 0);
+        }
+        else
+        {
+            _onReseed(muted != 0);
         }
 
         return true;
@@ -957,6 +1007,11 @@ internal sealed class MeetMuteSender
             return true;
         }
 
+        // Invoke does not need the Meet window to be focused, and it still
+        // reaches the button when the fullscreen toolbar is hidden (offscreen).
+        if (TryInvokeDesired(hwnd, needClick, alreadyOk, out via))
+            return true;
+
         // Muting is time-critical: Lenovo hardware mute soon breaks Meet's toolbar UIA.
         // Prefer focusing the page + Ctrl+D first when muting; keep mouse-click first for unmute.
         if (wantMuted)
@@ -1026,35 +1081,86 @@ internal sealed class MeetMuteSender
     }
 
     /// <summary>
+    /// UIA Invoke on the self-mute button. Works while another window is focused
+    /// and while Meet is fullscreen. Restores the previous foreground window.
+    /// </summary>
+    private static bool TryInvokeDesired(IntPtr hwnd, string[] needClick, string[] alreadyOk, out string via)
+    {
+        via = "";
+        if (!FindToolbarButton(hwnd, needClick, out var el, out var label) || el is null)
+            return false;
+
+        var prev = GetForegroundWindow();
+        try
+        {
+            if (!el.TryGetCurrentPattern(System.Windows.Automation.InvokePattern.Pattern, out var pattern) ||
+                pattern is not System.Windows.Automation.InvokePattern invoke)
+            {
+                Log.Write($"toolbar '{label}' has no Invoke pattern");
+                return false;
+            }
+
+            invoke.Invoke();
+            Log.Write($"toolbar invoke '{label}'");
+            // A new meeting is slow to rename the button. Ctrl+D after a short
+            // miss toggles it back and steals focus.
+            if (WaitForToolbarButton(hwnd, alreadyOk, timeoutMs: 1200, out _))
+            {
+                via = $"invoke:{label}";
+                return true;
+            }
+
+            Log.Write($"invoke '{label}' did not change Meet state");
+            return false;
+        }
+        catch (Exception ex)
+        {
+            Log.Write($"invoke error: {ex.Message}");
+            return false;
+        }
+        finally
+        {
+            RestoreForeground(prev);
+        }
+    }
+
+    private static void RestoreForeground(IntPtr prev)
+    {
+        if (prev == IntPtr.Zero || GetForegroundWindow() == prev)
+            return;
+        if (SetForegroundWindow(prev) && GetForegroundWindow() == prev)
+            return;
+        EnsureForeground(prev);
+    }
+
+    /// <summary>
     /// Focus Meet page content (not just the Chrome frame) then send Ctrl+D.
     /// </summary>
     private static bool TryMuteViaCtrlD(IntPtr hwnd, string[] successLabels, out string via)
     {
         via = "";
-        EnsureForeground(hwnd);
-        // Click middle of the window so the Meet document gets keyboard focus.
-        ClickWindowContent(hwnd);
-        Thread.Sleep(40);
-        SendCtrlD();
-        if (WaitForToolbarButton(hwnd, successLabels, timeoutMs: 450, out var okLabel))
+        var prev = GetForegroundWindow();
+        try
         {
-            via = $"mute:Ctrl+D-focused/{okLabel}";
-            Log.Write($"Ctrl+D verified → {okLabel}");
-            return true;
-        }
+            EnsureForeground(hwnd);
+            // Click middle of the window so the Meet document gets keyboard focus.
+            ClickWindowContent(hwnd);
+            Thread.Sleep(40);
+            SendCtrlD();
+            if (WaitForToolbarButton(hwnd, successLabels, timeoutMs: 700, out var okLabel))
+            {
+                via = $"mute:Ctrl+D-focused/{okLabel}";
+                Log.Write($"Ctrl+D verified → {okLabel}");
+                return true;
+            }
 
-        // Second try — some Meet layouts need a beat after focus click.
-        Thread.Sleep(80);
-        SendCtrlD();
-        if (WaitForToolbarButton(hwnd, successLabels, timeoutMs: 450, out okLabel))
+            Log.Write("Ctrl+D did not verify Meet mute UI change");
+            return false;
+        }
+        finally
         {
-            via = $"mute:Ctrl+D-retry/{okLabel}";
-            Log.Write($"Ctrl+D retry verified → {okLabel}");
-            return true;
+            RestoreForeground(prev);
         }
-
-        Log.Write("Ctrl+D did not verify Meet mute UI change");
-        return false;
     }
 
     private static void ClickWindowContent(IntPtr hwnd)
@@ -1237,7 +1343,7 @@ internal sealed class MeetMuteSender
             var toolbarTop = windowRect.Top + windowRect.Height * 0.72;
 
             System.Windows.Automation.AutomationElement? best = null;
-            var bestBottom = double.MinValue;
+            var bestScore = int.MinValue;
             var bestName = "";
 
             foreach (var name in names)
@@ -1254,20 +1360,18 @@ internal sealed class MeetMuteSender
                 {
                     try
                     {
-                        if (el.Current.IsOffscreen)
-                            continue;
                         if (!el.Current.IsEnabled)
                             continue;
 
+                        var offscreen = el.Current.IsOffscreen;
                         var rect = el.Current.BoundingRectangle;
-                        if (rect.IsEmpty || rect.Width <= 0 || rect.Height <= 0)
-                            continue;
-                        if (rect.Top < toolbarTop)
-                            continue;
-
-                        if (rect.Bottom >= bestBottom)
+                        var inToolbar = !rect.IsEmpty && rect.Height > 0 && rect.Top >= toolbarTop;
+                        // Prefer the visible bottom-bar control. Fullscreen hides that bar,
+                        // so an offscreen button with the same name is still a valid target.
+                        var score = offscreen ? 1 : inToolbar ? 3 : 2;
+                        if (score > bestScore)
                         {
-                            bestBottom = rect.Bottom;
+                            bestScore = score;
                             best = el;
                             bestName = name;
                         }
