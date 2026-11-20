@@ -1012,71 +1012,17 @@ internal sealed class MeetMuteSender
         if (TryInvokeDesired(hwnd, needClick, alreadyOk, out via))
             return true;
 
-        // Muting is time-critical: Lenovo hardware mute soon breaks Meet's toolbar UIA.
-        // Prefer focusing the page + Ctrl+D first when muting; keep mouse-click first for unmute.
-        if (wantMuted)
-        {
-            if (TryMuteViaCtrlD(hwnd, alreadyOk, out via))
-                return true;
-
-            // Brief retry for toolbar button before it disappears.
-            if (WaitForToolbarButton(hwnd, needClick, timeoutMs: 120, out var earlyLabel) &&
-                FindToolbarButton(hwnd, needClick, out var earlyEl, out _) && earlyEl is not null)
-            {
-                EnsureForeground(hwnd);
-                ClickElementCenter(earlyEl);
-                if (WaitForToolbarButton(hwnd, alreadyOk, timeoutMs: 300, out _))
-                {
-                    via = $"mute:{earlyLabel}+mouse-retry";
-                    return true;
-                }
-            }
-
-            via = "FAILED-mute";
-            Log.Write("mute failed after Ctrl+D and toolbar retry");
-            return false;
-        }
-
-        // Unmute path (historically reliable with mouse click).
-        if (FindToolbarButton(hwnd, needClick, out var el, out var label) && el is not null)
-        {
-            EnsureForeground(hwnd);
-            Thread.Sleep(30);
-            var clicked = ClickElementCenter(el);
-            Log.Write($"toolbar click '{label}' via={(clicked ? "mouse" : "none")}");
-
-            if (WaitForToolbarButton(hwnd, alreadyOk, timeoutMs: 350, out _))
-            {
-                via = $"unmute:{label}+mouse";
-                return true;
-            }
-
-            try
-            {
-                if (el.TryGetCurrentPattern(System.Windows.Automation.InvokePattern.Pattern, out var pattern) &&
-                    pattern is System.Windows.Automation.InvokePattern invoke)
-                {
-                    invoke.Invoke();
-                    if (WaitForToolbarButton(hwnd, alreadyOk, timeoutMs: 350, out _))
-                    {
-                        via = $"unmute:{label}+invoke";
-                        return true;
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Log.Write($"UIA invoke error: {ex.Message}");
-            }
-        }
-
+        // No mouse clicks. The camera's "Video settings" arrow sits beside the
+        // mic button and opens Backgrounds and effects; a click aimed at the mic
+        // lands there often enough to matter.
         if (TryMuteViaCtrlD(hwnd, alreadyOk, out via))
         {
-            via = via.Replace("mute:", "unmute:");
+            if (!wantMuted)
+                via = via.Replace("mute:", "unmute:");
             return true;
         }
 
-        via = "FAILED-unmute";
+        via = wantMuted ? "FAILED-mute" : "FAILED-unmute";
         return false;
     }
 
@@ -1143,8 +1089,10 @@ internal sealed class MeetMuteSender
         try
         {
             EnsureForeground(hwnd);
-            // Click middle of the window so the Meet document gets keyboard focus.
-            ClickWindowContent(hwnd);
+            // Focus the page without a mouse click. A click in the meeting
+            // hits the self-view or the video-settings arrow and opens
+            // Backgrounds and effects.
+            FocusMeetPage(hwnd);
             Thread.Sleep(40);
             SendCtrlD();
             if (WaitForToolbarButton(hwnd, successLabels, timeoutMs: 700, out var okLabel))
@@ -1163,102 +1111,24 @@ internal sealed class MeetMuteSender
         }
     }
 
-    private static void ClickWindowContent(IntPtr hwnd)
-    {
-        if (!GetWindowRect(hwnd, out var wr))
-            return;
-
-        // Slightly above bottom toolbar, horizontally centered — Meet video area.
-        var x = wr.Left + (wr.Right - wr.Left) / 2;
-        var y = wr.Top + (int)((wr.Bottom - wr.Top) * 0.55);
-        ClickScreenPoint(x, y);
-    }
-
-    private static bool ClickElementCenter(System.Windows.Automation.AutomationElement el)
+    private static void FocusMeetPage(IntPtr hwnd)
     {
         try
         {
-            var rect = el.Current.BoundingRectangle;
-            if (rect.IsEmpty || rect.Width < 4 || rect.Height < 4)
-                return false;
+            var root = System.Windows.Automation.AutomationElement.FromHandle(hwnd);
+            if (root is null)
+                return;
 
-            var x = (int)Math.Round(rect.Left + rect.Width / 2);
-            var y = (int)Math.Round(rect.Top + rect.Height / 2);
-            return ClickScreenPoint(x, y);
+            var doc = root.FindFirst(
+                System.Windows.Automation.TreeScope.Descendants,
+                new System.Windows.Automation.PropertyCondition(
+                    System.Windows.Automation.AutomationElement.ControlTypeProperty,
+                    System.Windows.Automation.ControlType.Document));
+            (doc ?? root).SetFocus();
         }
         catch (Exception ex)
         {
-            Log.Write($"ClickElementCenter error: {ex.Message}");
-            return false;
-        }
-    }
-
-    private static bool ClickScreenPoint(int x, int y)
-    {
-        try
-        {
-            GetCursorPos(out var prev);
-            var vx = GetSystemMetrics(76); // SM_XVIRTUALSCREEN
-            var vy = GetSystemMetrics(77);
-            var vw = GetSystemMetrics(78);
-            var vh = GetSystemMetrics(79);
-            if (vw <= 0 || vh <= 0)
-                return false;
-
-            var absX = (int)Math.Round((x - vx) * 65535.0 / Math.Max(vw - 1, 1));
-            var absY = (int)Math.Round((y - vy) * 65535.0 / Math.Max(vh - 1, 1));
-
-            var inputs = new[]
-            {
-                new INPUT
-                {
-                    type = InputType.INPUT_MOUSE,
-                    U = new InputUnion
-                    {
-                        mi = new MOUSEINPUT
-                        {
-                            dx = absX,
-                            dy = absY,
-                            dwFlags = MouseEventF.MOVE | MouseEventF.ABSOLUTE | MouseEventF.VIRTUALDESK
-                        }
-                    }
-                },
-                new INPUT
-                {
-                    type = InputType.INPUT_MOUSE,
-                    U = new InputUnion { mi = new MOUSEINPUT { dwFlags = MouseEventF.LEFTDOWN } }
-                },
-                new INPUT
-                {
-                    type = InputType.INPUT_MOUSE,
-                    U = new InputUnion { mi = new MOUSEINPUT { dwFlags = MouseEventF.LEFTUP } }
-                }
-            };
-
-            var sent = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<INPUT>());
-
-            var prevAbsX = (int)Math.Round((prev.X - vx) * 65535.0 / Math.Max(vw - 1, 1));
-            var prevAbsY = (int)Math.Round((prev.Y - vy) * 65535.0 / Math.Max(vh - 1, 1));
-            var restore = new INPUT
-            {
-                type = InputType.INPUT_MOUSE,
-                U = new InputUnion
-                {
-                    mi = new MOUSEINPUT
-                    {
-                        dx = prevAbsX,
-                        dy = prevAbsY,
-                        dwFlags = MouseEventF.MOVE | MouseEventF.ABSOLUTE | MouseEventF.VIRTUALDESK
-                    }
-                }
-            };
-            _ = SendInput(1, [restore], Marshal.SizeOf<INPUT>());
-            return sent == inputs.Length;
-        }
-        catch (Exception ex)
-        {
-            Log.Write($"ClickScreenPoint error: {ex.Message}");
-            return false;
+            Log.Write($"focus page: {ex.Message}");
         }
     }
 
@@ -1276,26 +1146,21 @@ internal sealed class MeetMuteSender
             return false;
         }
 
-        EnsureForeground(hwnd);
-        Thread.Sleep(30);
-        if (!ClickElementCenter(el))
+        try
         {
-            try
-            {
-                if (el.TryGetCurrentPattern(System.Windows.Automation.InvokePattern.Pattern, out var pattern) &&
-                    pattern is System.Windows.Automation.InvokePattern invoke)
-                    invoke.Invoke();
-                else
-                {
-                    via = "";
-                    return false;
-                }
-            }
-            catch
+            if (el.TryGetCurrentPattern(System.Windows.Automation.InvokePattern.Pattern, out var pattern) &&
+                pattern is System.Windows.Automation.InvokePattern invoke)
+                invoke.Invoke();
+            else
             {
                 via = "";
                 return false;
             }
+        }
+        catch
+        {
+            via = "";
+            return false;
         }
 
         via = $"UIA-toggle:{name}";
@@ -1366,9 +1231,13 @@ internal sealed class MeetMuteSender
                         var offscreen = el.Current.IsOffscreen;
                         var rect = el.Current.BoundingRectangle;
                         var inToolbar = !rect.IsEmpty && rect.Height > 0 && rect.Top >= toolbarTop;
+                        // The mic icon is the narrow button. The wider pill is "Audio
+                        // settings" / "Video settings"; invoking or clicking that opens
+                        // Backgrounds and effects.
+                        var tight = !rect.IsEmpty && rect.Width is >= 36 and <= 100;
                         // Prefer the visible bottom-bar control. Fullscreen hides that bar,
                         // so an offscreen button with the same name is still a valid target.
-                        var score = offscreen ? 1 : inToolbar ? 3 : 2;
+                        var score = (offscreen ? 1 : inToolbar ? 3 : 2) * 10 + (tight ? 1 : 0);
                         if (score > bestScore)
                         {
                             bestScore = score;
